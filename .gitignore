@@ -1,0 +1,15 @@
+/.idea
+/coverage.txt
+/build/
+/dist/
+
+# possible when testing
+/func-e
+/Tetrate.func-e.yaml
+/manifests/
+
+# Local Netlify folder
+.netlify
+.DS_Store
+
+/site/.hugo_build.lock

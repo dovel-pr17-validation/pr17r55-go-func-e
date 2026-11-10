@@ -1,0 +1,108 @@
+# `name` value will appear "as is" in the badge.
+# See https://docs.github.com/en/actions/configuring-and-managing-workflows/configuring-a-workflow#adding-a-workflow-status-badge-to-your-repository
+# yamllint --format github .github/workflows/release.yaml
+---
+name: "release"
+
+on:
+  push:
+    tags: 'v[0-9]+.[0-9]+.[0-9]+**'  # Ex. v0.2.0 v0.2.1-rc2
+
+defaults:
+  run:  # use bash for all operating systems unless overridden
+    shell: bash
+
+jobs:
+  func-e:
+    name: "Release `func-e` CLI"
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v6
+        with:  # fetch all history for all tags and branches (needed for changelog)
+          fetch-depth: 0
+
+      - name: "Make release assets (test)"
+        if: github.event_name != 'push' || !contains(github.ref, 'refs/tags/')
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          make dist VERSION=$VERSION
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+        shell: bash
+
+      - name: "Make release assets"
+        # Triggers only on tag creation.
+        if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          make dist VERSION=$VERSION
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+        shell: bash
+
+      - name: "Create draft release"
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          ./.github/workflows/release_notes.sh ${tag} > release-notes.txt
+          gh release create ${tag} --draft \
+            --title ${tag} --notes-file release-notes.txt ./dist/*
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  e2e:
+    needs: func-e
+    name: Run e2e tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90  # instead of 360 by default
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            tarball: '*linux_amd64.tar.gz'
+            deb: '*linux_amd64.deb'
+            rpm: '*linux_x86_64.rpm'
+          - os: ubuntu-24.04-arm
+            tarball: '*linux_arm64.tar.gz'
+            deb: '*linux_arm64.deb'
+            rpm: '*linux_aarch64.rpm'
+          - os: macos-26
+            tarball: '*darwin_arm64.tar.gz'
+
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          cache: false
+          go-version-file: go.mod
+
+      - name: "Extract `func-e` binary from GitHub release assets"
+        id: download  # allows variables like ${{ steps.download.outputs.X }}
+        run: |
+          gh release download "${GITHUB_REF#refs/tags/}" -p '${{ matrix.tarball }}'
+          tar -xzf *.tar.gz && rm *.tar.gz
+        env:  # authenticate release downloads as drafts are not public
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "Run e2e tests using draft `func-e` binary"
+        run: E2E_FUNC_E_PATH=. make e2e
+
+      - name: "Test Debian package"
+        if: matrix.deb
+        run: |
+          gh release download "${GITHUB_REF#refs/tags/}" -p '${{ matrix.deb }}' -D dist
+          packaging/nfpm/verify_deb.sh
+        env:  # authenticate release downloads as drafts are not public
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "Test RPM package (CentOS)"
+        if: matrix.rpm
+        run: |  # Note: the naming convention is intentionally different for RPM: x86_64 not amd64, aarch64 not arm64!
+          gh release download "${GITHUB_REF#refs/tags/}" -p '${{ matrix.rpm }}' -D dist
+          docker run --rm -v $PWD:/work --entrypoint packaging/nfpm/verify_rpm.sh ${CENTOS_IMAGE}
+        env:  # authenticate release downloads as drafts are not public
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CENTOS_IMAGE: ghcr.io/tetratelabs/func-e-internal:centos-9  # See internal-images.yml

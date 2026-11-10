@@ -1,0 +1,20 @@
+NAME:
+   func-e run - Run Envoy with the given [arguments...] until interrupted
+
+USAGE:
+   func-e run [arguments...]
+
+DESCRIPTION:
+   To run Envoy, execute `func-e run -c your_envoy_config.yaml`.
+
+   The first version in the below is run, controllable by the "use" command:
+   ```
+   $ENVOY_VERSION, $PWD/.envoy-version, $FUNC_E_CONFIG_HOME/envoy-version
+   ```
+   The version to use is downloaded and installed, if necessary.
+
+   Envoy interprets the '[arguments...]' and runs in the current working
+   directory (aka $PWD) until func-e is interrupted (ex Ctrl+C, Ctrl+Break).
+
+   Envoy's console output writes to "stdout.log" and "stderr.log" in the run directory
+   (`${HOME}/.local/state/func-e`/envoy-logs/{runID}).

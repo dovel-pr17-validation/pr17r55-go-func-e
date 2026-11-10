@@ -1,0 +1,194 @@
+// Copyright func-e contributors
+// SPDX-License-Identifier: Apache-2.0
+
+package e2e
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/tetratelabs/func-e/internal/version"
+)
+
+// TestFuncEUse needs to always execute, so we run it in a separate data directory
+func TestFuncEUse(t *testing.T) {
+	configHome := t.TempDir()
+	dataHome := t.TempDir()
+
+	t.Run("not yet installed", func(t *testing.T) {
+		stdout, stderr, err := funcEExec(t.Context(), "--config-home", configHome, "--data-home", dataHome, "use", version.LastKnownEnvoy.String())
+		require.NoError(t, err)
+		require.Regexp(t, `^downloading https:.*tar.*z\r?\n$`, stdout)
+		require.Empty(t, stderr)
+
+		// The binary was installed
+		envoyBin := filepath.Join(dataHome, "envoy-versions", version.LastKnownEnvoy.String(), "bin", "envoy"+"")
+		require.FileExists(t, envoyBin)
+
+		// The current version was written
+		f, err := os.ReadFile(filepath.Join(configHome, "envoy-version"))
+		require.NoError(t, err)
+		require.Equal(t, version.LastKnownEnvoy, version.PatchVersion(f))
+	})
+
+	t.Run("already installed", func(t *testing.T) {
+		stdout, stderr, err := funcEExec(t.Context(), "--config-home", configHome, "--data-home", dataHome, "use", version.LastKnownEnvoy.String())
+		require.NoError(t, err)
+		require.Equal(t, version.LastKnownEnvoy.String()+" is already downloaded\n", stdout)
+		require.Empty(t, stderr)
+	})
+}
+
+func TestFuncEUse_DevLatest(t *testing.T) {
+	configHome := t.TempDir()
+	dataHome := t.TempDir()
+
+	// Install dev
+	_, _, err := funcEExec(t.Context(), "--config-home", configHome, "--data-home", dataHome, "use", "dev")
+	require.NoError(t, err)
+
+	t.Run("up to date", func(t *testing.T) {
+		stdout, stderr, err := funcEExec(t.Context(), "--config-home", configHome, "--data-home", dataHome, "use", "dev-latest")
+		require.NoError(t, err)
+		require.Empty(t, stdout)
+		require.Empty(t, stderr)
+	})
+
+	t.Run("out of date", func(t *testing.T) {
+		stale := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+		require.NoError(t, os.Chtimes(filepath.Join(dataHome, "envoy-versions", "dev"), stale, stale))
+
+		stdout, stderr, err := funcEExec(t.Context(), "--config-home", configHome, "--data-home", dataHome, "use", "dev-latest")
+		require.NoError(t, err)
+		require.Regexp(t, `^downloading https:.*tar.*z\r?\n$`, stdout)
+		require.Empty(t, stderr)
+	})
+}
+
+func TestFuncEUse_UnknownVersion(t *testing.T) {
+	v := "1.1.1"
+	stdout, stderr, err := funcEExec(t.Context(), "use", v)
+
+	require.EqualError(t, err, "exit status 1")
+	require.Empty(t, stdout)
+	require.Equal(t, fmt.Sprintf(`error: couldn't find version "%s" for platform "%s/%s"
+`, v, runtime.GOOS, runtime.GOARCH), stderr)
+}
+
+func TestFuncEUse_UnknownMinorVersion(t *testing.T) {
+	v := "1.1"
+	stdout, stderr, err := funcEExec(t.Context(), "use", v)
+
+	require.EqualError(t, err, "exit status 1")
+	require.Regexp(t, `^looking up the latest patch for Envoy version 1.1\r?\n$`, stdout)
+	stderrPattern := fmt.Sprintf("^error: https://.*json does not contain an Envoy release for version 1.1 on platform %s/%s\r?\n$", runtime.GOOS, runtime.GOARCH)
+	require.Regexp(t, stderrPattern, stderr)
+}
+
+// TODO: this test overuses bandwidth, making it tedious especially on slow networks.
+// Parse the envoy-versions.json to dynamically select the version before LastKnownEnvoyMinor if it isn't consistent.
+// That or don't update LastKnownEnvoy until it is consistent.
+func TestFuncEUse_MinorVersion(t *testing.T) {
+	// The intended minor version to be installed. This version is known to have darwin and linux binaries.
+	minorVersion := "1.24"
+
+	allVersions, _, err := funcEExec(t.Context(), "versions", "-a")
+	require.NoError(t, err)
+
+	baseVersion, upgradedVersion := getVersionsRange(allVersions, minorVersion)
+
+	configHome := t.TempDir()
+	dataHome := t.TempDir()
+
+	t.Run("install last known", func(t *testing.T) {
+		stdout, stderr, err := funcEExec(t.Context(), "--config-home", configHome, "--data-home", dataHome, "use", version.LastKnownEnvoy.String())
+
+		require.NoError(t, err)
+		require.Regexp(t, `^downloading https:.*tar.*z\r?\n$`, stdout)
+		require.Empty(t, stderr)
+
+		// The binary was installed
+		envoyBin := filepath.Join(dataHome, "envoy-versions", version.LastKnownEnvoy.String(), "bin", "envoy"+"")
+		require.FileExists(t, envoyBin)
+
+		// The current version was written
+		f, err := os.ReadFile(filepath.Join(configHome, "envoy-version"))
+		require.NoError(t, err)
+		require.Equal(t, version.LastKnownEnvoy, version.PatchVersion(f))
+	})
+
+	t.Run(fmt.Sprintf("install %s as base version", baseVersion), func(t *testing.T) {
+		stdout, stderr, err := funcEExec(t.Context(), "--config-home", configHome, "--data-home", dataHome, "use", baseVersion)
+
+		require.NoError(t, err)
+		require.Regexp(t, `^downloading https:.*tar.*z\r?\n$`, stdout)
+		require.Empty(t, stderr)
+
+		// The binary was installed
+		envoyBin := filepath.Join(dataHome, "envoy-versions", baseVersion, "bin", "envoy"+"")
+		require.FileExists(t, envoyBin)
+
+		// The base version was written
+		f, err := os.ReadFile(filepath.Join(configHome, "envoy-version"))
+		require.NoError(t, err)
+		require.Equal(t, baseVersion, string(f))
+	})
+
+	t.Run(fmt.Sprintf("install %s as upgraded version", upgradedVersion), func(t *testing.T) {
+		stdout, stderr, err := funcEExec(t.Context(), "--config-home", configHome, "--data-home", dataHome, "use", minorVersion)
+
+		require.NoError(t, err)
+		require.Regexp(t, `^looking up the latest patch for Envoy version 1.24\r?\ndownloading https:.*tar.*z\r?\n$`, stdout)
+		require.Empty(t, stderr)
+
+		// The binary was installed
+		envoyBin := filepath.Join(dataHome, "envoy-versions", upgradedVersion, "bin", "envoy"+"")
+		require.FileExists(t, envoyBin)
+
+		// The upgraded version was written
+		f, err := os.ReadFile(filepath.Join(configHome, "envoy-version"))
+		require.NoError(t, err)
+		require.Equal(t, minorVersion, string(f))
+	})
+
+	t.Run("use upgraded version after downloaded", func(t *testing.T) {
+		stdout, stderr, err := funcEExec(t.Context(), "--config-home", configHome, "--data-home", dataHome, "use", minorVersion)
+		require.NoError(t, err)
+		require.Equal(t, fmt.Sprintf("looking up the latest patch for Envoy version 1.24\n%s is already downloaded\n", upgradedVersion), stdout)
+		require.Empty(t, stderr)
+	})
+
+	t.Run("which upgraded version", func(t *testing.T) {
+		stdout, stderr, err := funcEExec(t.Context(), "--config-home", configHome, "--data-home", dataHome, "which")
+		relativeEnvoyBin := filepath.Join("envoy-versions", upgradedVersion, "bin", "envoy"+"")
+		require.Contains(t, stdout, relativeEnvoyBin+"\n")
+		require.Empty(t, stderr)
+		require.NoError(t, err)
+	})
+}
+
+// getVersionsRange returns the first and latest patch of a minor version.
+func getVersionsRange(stdout, minor string) (first, latest string) {
+	s := bufio.NewScanner(strings.NewReader(stdout))
+	for s.Scan() {
+		// Ex. "  1.20.0 2021-10-05" or "* 1.20.0 2021-10-05" -> "1.20.0"
+		v := strings.Split(s.Text()[2:], " ")[0]
+		if strings.HasPrefix(v, minor+".") {
+			// "func-e versions" returns in descending order
+			if latest == "" {
+				latest = v
+			} else {
+				first = v
+			}
+		}
+	}
+	return first, latest
+}

@@ -1,0 +1,90 @@
+# yamllint --format github .github/workflows/internal-images.yml
+---
+name: internal-images
+
+# Refresh the tags once a day. This limits impact of rate-limited images. See RATIONALE.md
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:  # Allows manual refresh
+
+# This builds images and pushes them to ghcr.io/tetratelabs/func-e-internal:$tag
+# Using these in tests and as a parent (FROM) avoids docker.io rate-limits particularly on pull requests.
+#
+# To test this, try running end-to-end (e2e) tests!
+# ```bash
+# $ docker run --pull always --rm -v $PWD:/work ghcr.io/tetratelabs/func-e-internal:centos-9 e2e
+# ```
+#
+# Make is the default entrypoint. To troubleshoot, use /bin/bash:
+# ```bash
+# $ docker run --pull always --rm -v $PWD:/work -it --entrypoint /bin/bash ghcr.io/tetratelabs/func-e-internal:centos-9
+# [runner@babce89b5580 work]$
+# ```
+jobs:
+  build-and-push-images:
+    runs-on: ubuntu-24.04  # Hard-coding an LTS means maintenance, but only once each 2 years!
+    strategy:
+      matrix:
+        include:
+          - parent_image: quay.io/centos/centos:stream9  # Envoy requires CentOS >=9.
+            image_tag: centos-9
+          - parent_image: ubuntu:24.04  # Always match runs-on!
+            image_tag: ubuntu-24.04
+
+    steps:
+      # Same as doing this locally: echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_TOKEN}" --password-stdin
+      - name: "Login into GitHub Container Registry"
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          # GHCR_TOKEN=<hex token value>
+          #   - pushes Docker images to ghcr.io
+          #   - create via https://github.com/settings/tokens
+          #   - assign via https://github.com/organizations/tetratelabs/settings/secrets/actions
+          #   - needs repo:status, public_repo, write:packages, delete:packages
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      # We need QEMU and Buildx for multi-platform (amd64+arm64) image push.
+      - name: "Setup QEMU"
+        uses: docker/setup-qemu-action@v4
+
+      - name: "Setup Buildx"
+        uses: docker/setup-buildx-action@v4
+
+      - name: "Checkout"
+        uses: actions/checkout@v6
+
+      # This finds the last two GOROOT variables and parses them into Docker
+      # build args, so that the resulting image has them at the same location.
+      #
+      # We do this to allow pull requests to update go.mod with a new Golang
+      # release without worrying if the Docker image has it, yet.
+      #
+      # Ex. GOROOT_1_19_X64=/opt/hostedtoolcache/go/1.19.4/x64 ->
+      #     GO_STABLE_RELEASE=1_19, GO_STABLE_REVISION=1.19.4
+      - name: "Find and parse last two GOROOTs"
+        run: |  # Until Go releases hit triple digits, we can use simple ordering.
+          goroot_stable_env=$(env|grep GOROOT_|sort -n|tail -1)
+          echo "GO_STABLE_RELEASE=$(echo ${goroot_stable_env}|cut -d_ -f2,3)" >> $GITHUB_ENV
+          echo "GO_STABLE_REVISION=$(echo ${goroot_stable_env}|cut -d/ -f5)" >> $GITHUB_ENV
+
+          goroot_prior_env=$(env|grep GOROOT_|sort -n|tail -2|head -1)
+          echo "GO_PRIOR_RELEASE=$(echo ${goroot_prior_env}|cut -d_ -f2,3)" >> $GITHUB_ENV
+          echo "GO_PRIOR_REVISION=$(echo ${goroot_prior_env}|cut -d/ -f5)" >> $GITHUB_ENV
+
+      - name: "Build and push"
+        run: |
+          docker_tag=ghcr.io/${{ github.repository_owner }}/func-e-internal:${IMAGE_TAG}
+          docker buildx build --push \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg parent_image=${PARENT_IMAGE} \
+            --build-arg go_stable_release=${GO_STABLE_RELEASE} \
+            --build-arg go_stable_revision=${GO_STABLE_REVISION} \
+            --build-arg go_prior_release=${GO_PRIOR_RELEASE} \
+            --build-arg go_prior_revision=${GO_PRIOR_REVISION} \
+            -t ${docker_tag} .github/workflows
+        env:
+          PARENT_IMAGE: ${{ matrix.parent_image }}
+          IMAGE_TAG: ${{ matrix.image_tag }}

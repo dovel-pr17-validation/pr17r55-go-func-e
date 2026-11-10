@@ -1,0 +1,8 @@
+NAME:
+   func-e versions - List Envoy versions
+
+USAGE:
+   func-e versions [options]
+
+OPTIONS:
+   --all, -a  Show all versions including ones not yet installed
